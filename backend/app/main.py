@@ -30,6 +30,7 @@ app = FastAPI(
 # Configuration CORS
 origins = [
     "http://localhost:3000",
+    "https://metisagora.vercel.app",
 ]
 
 app.add_middleware(
