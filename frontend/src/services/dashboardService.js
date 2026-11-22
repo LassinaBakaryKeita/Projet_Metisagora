@@ -30,6 +30,23 @@ export const dashboardService = {
         price: Number(product.price),
         stock: product.stock,
       })),
+
+      weeklyActivity: data.weekly_activity
+        ? {
+            totalConversations: data.weekly_activity.total_conversations,
+            aiResolutionRate: data.weekly_activity.ai_resolution_rate,
+            avgResponseTime: data.weekly_activity.avg_response_time,
+            activeNow: data.weekly_activity.active_now,
+            days: data.weekly_activity.days.map((d) => ({
+              day: d.day,
+              date: d.date,
+              conversations: d.conversations,
+              resolvedByAi: d.resolved_by_ai,
+              escalated: d.escalated,
+              isToday: d.is_today,
+            })),
+          }
+        : null,
     };
   },
 };
