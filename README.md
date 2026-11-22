@@ -10,6 +10,3 @@
 
 
 
-# Indentifiants de l'Admin pour le tester 
-Email : admin@metisagora.com
-Mot de passe : Admin@2026Secure
