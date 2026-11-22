@@ -1,0 +1,35 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-primary: #0B0F10;
+    --bg-surface: #121313;
+    --bg-card: #1A1F1F;
+    --brand-cyan: #13F2F8;
+    --brand-cyan-hover: #279DA1;
+    --border-line: #252629;
+  }
+
+  body {
+    background-color: #0B0F10;
+    color: #FAFAFA;
+    font-family: 'Plus Jakarta Sans', system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, Cantarell, sans-serif;
+  }
+}
+
+/* Custom scrollbars matching the dark cyan aesthetic */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #0B0F10;
+}
+::-webkit-scrollbar-thumb {
+  background: #252629;
+  border-radius: 9999px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(19, 242, 248, 0.4);
+}
+
