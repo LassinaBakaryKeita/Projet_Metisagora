@@ -1,5 +1,6 @@
 
 import json
+import logging
 
 from google import genai
 from google.genai import types
@@ -23,24 +24,142 @@ from app.modules.notifications import service as notification_service
 from app.modules.notifications.schemas import NotificationCreate
 
 
-# Configuration
-GEMINI_MODEL = "gemini-3.1-flash-lite"
+logger = logging.getLogger(__name__)
 
 
-# Phase A : Analyse de l'intention
+
+# CONFIGURATION DES MODÈLES GEMINI
+
+
+GEMINI_MODELS = [
+    "gemini-3.1-flash-lite",
+    "gemini-3.5-flash-lite",
+    "gemini-3.8-flash"
+]
+
+# Erreurs temporaires pouvant justifier un changement de modèle
+RETRYABLE_STATUS_CODES = {
+    408, 429, 500, 502, 503, 504
+}
+
+
+# ============================================================
+# GÉNÉRATION AVEC FALLBACK
+# ============================================================
+
+def is_retryable_error(error: Exception) -> bool:
+    """
+    Determines whether an error is temporary
+    and whether another Gemini model should be tried.
+    """
+
+    status_code = getattr(error, "code", None)
+
+    if status_code is None:
+        status_code = getattr(error, "status_code", None)
+
+    try:
+        status_code = int(status_code)
+    except (TypeError, ValueError):
+        return False
+
+    return status_code in RETRYABLE_STATUS_CODES
+
+
+async def generate_with_fallback(
+    client: genai.Client,
+    contents: str,
+    system_instruction: str,
+    temperature: float,
+    response_mime_type: str | None = None
+):
+    """
+    Tries Gemini models sequentially.
+
+    If a model encounters a temporary availability error,
+    the next model is automatically used.
+    """
+
+    last_error = None
+
+    for index, model in enumerate(GEMINI_MODELS):
+
+        try:
+            logger.info(
+                "Trying Gemini model: %s",
+                model
+            )
+
+            config = types.GenerateContentConfig(
+                system_instruction=system_instruction,
+                temperature=temperature,
+                response_mime_type=response_mime_type
+            )
+
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config
+            )
+
+            logger.info(
+                "Gemini response generated successfully "
+                "using model: %s",
+                model
+            )
+
+            return response
+
+        except Exception as error:
+
+            last_error = error
+
+            # Do not switch models for permanent errors
+            if not is_retryable_error(error):
+                logger.exception(
+                    "Non-retryable Gemini error with model %s",
+                    model
+                )
+                raise
+
+            logger.warning(
+                "Gemini model %s is temporarily unavailable. "
+                "Trying the next model. Error: %s",
+                model,
+                error
+            )
+
+            # No more models available
+            if index == len(GEMINI_MODELS) - 1:
+                break
+
+    logger.error(
+        "All Gemini models are currently unavailable."
+    )
+
+    if last_error:
+        raise last_error
+
+    raise RuntimeError(
+        "No Gemini model could generate a response."
+    )
+
+
+# ============================================================
+# PHASE A : ANALYSE DE L'INTENTION DU CLIENT
+# ============================================================
+
 async def analyze_customer_intent(
     client: genai.Client,
     customer_message: str
 ) -> IntentAnalysis:
 
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL,
+    response = await generate_with_fallback(
+        client=client,
         contents=customer_message,
-        config=types.GenerateContentConfig(
-            system_instruction=INTENT_ANALYSIS_PROMPT,
-            response_mime_type="application/json",
-            temperature=0
-        )
+        system_instruction=INTENT_ANALYSIS_PROMPT,
+        temperature=0,
+        response_mime_type="application/json"
     )
 
     content = response.text
@@ -50,17 +169,19 @@ async def analyze_customer_intent(
             "Gemini returned an empty intent analysis."
         )
 
-    # Validation stricte avec Pydantic
+    # Strict validation with Pydantic
     return IntentAnalysis.model_validate_json(content)
 
 
-# Recherche des produits dans PostgreSQL
+# ============================================================
+# RECHERCHE DES PRODUITS DANS POSTGRESQL
+# ============================================================
+
 def search_relevant_products(
     db: Session,
     intent_analysis: IntentAnalysis
 ) -> list[ProductContext]:
 
-    # La recherche concerne uniquement les intentions commerciales
     product_intents = {
         CustomerIntent.PRODUCT_SEARCH,
         CustomerIntent.PRICE_INQUIRY,
@@ -70,11 +191,9 @@ def search_relevant_products(
     if intent_analysis.intent not in product_intents:
         return []
 
-    # Si le nom du produit manque, inutile de lancer une recherche
     if not intent_analysis.product_name:
         return []
 
-    # Recherche dans PostgreSQL
     result = product_service.get_products(
         db=db,
         page=1,
@@ -84,7 +203,6 @@ def search_relevant_products(
 
     products = result["items"]
 
-    # Conversion des modèles SQLAlchemy en schémas Pydantic
     return [
         ProductContext(
             id=product.id,
@@ -97,23 +215,27 @@ def search_relevant_products(
     ]
 
 
-# Décision métier : Escalade humaine
+# ============================================================
+# DÉCISION MÉTIER : ESCALADE HUMAINE
+# ============================================================
+
 def should_escalate(
     intent_analysis: IntentAnalysis
 ) -> bool:
 
-    # Une demande humaine explicite est toujours prioritaire
     if intent_analysis.intent == CustomerIntent.HUMAN_REQUEST:
         return True
 
-    # Le backend décide en fonction de la recommandation de Gemini
     if intent_analysis.escalation_recommended:
         return True
 
     return False
 
 
-# Création d'une notification
+# ============================================================
+# CRÉATION D'UNE NOTIFICATION
+# ============================================================
+
 def create_escalation_notification(
     db: Session,
     customer_message: str,
@@ -127,7 +249,6 @@ def create_escalation_notification(
         or "Une intervention humaine est nécessaire."
     )
 
-    # Priorité définie par le backend
     priority = (
         "high"
         if intent_analysis.intent == CustomerIntent.HUMAN_REQUEST
@@ -150,7 +271,10 @@ def create_escalation_notification(
     return reason
 
 
-# Phase B : Génération de la réponse
+# ============================================================
+# PHASE B : GÉNÉRATION DE LA RÉPONSE AU CLIENT
+# ============================================================
+
 async def generate_customer_response(
     client: genai.Client,
     customer_message: str,
@@ -158,7 +282,6 @@ async def generate_customer_response(
     products: list[ProductContext]
 ) -> str:
 
-    # Préparation des données fiables issues de PostgreSQL
     product_data = [
         product.model_dump(mode="json")
         for product in products
@@ -170,8 +293,8 @@ async def generate_customer_response(
         "products_from_database": product_data
     }
 
-    response = await client.aio.models.generate_content(
-        model=GEMINI_MODEL,
+    response = await generate_with_fallback(
+        client=client,
         contents=(
             "Voici le contexte de la conversation et "
             "les données commerciales disponibles.\n\n"
@@ -181,10 +304,8 @@ async def generate_customer_response(
                 indent=2
             )
         ),
-        config=types.GenerateContentConfig(
-            system_instruction=CUSTOMER_RESPONSE_PROMPT,
-            temperature=0.4
-        )
+        system_instruction=CUSTOMER_RESPONSE_PROMPT,
+        temperature=0.4
     )
 
     content = response.text
@@ -197,7 +318,10 @@ async def generate_customer_response(
     return content.strip()
 
 
-# Orchestrateur principal
+# ============================================================
+# ORCHESTRATEUR PRINCIPAL
+# ============================================================
+
 async def process_customer_message(
     db: Session,
     client: genai.Client,
@@ -206,13 +330,13 @@ async def process_customer_message(
     customer_name: str | None = None
 ) -> ChatbotResponse:
 
-    # 1. ANALYSE DE L'INTENTION
+    # Phase A : Analyse de l'intention
     intent_analysis = await analyze_customer_intent(
         client=client,
         customer_message=customer_message
     )
 
-    # 2. VERIFICATION DE L'ESCALADE
+    # Vérification d'une éventuelle escalade humaine
     if should_escalate(intent_analysis):
 
         escalation_reason = create_escalation_notification(
@@ -235,13 +359,13 @@ async def process_customer_message(
             intent=intent_analysis.intent
         )
 
-    # 3. RECHERCHE DES PRODUITS
+    # Recherche des produits dans PostgreSQL
     products = search_relevant_products(
         db=db,
         intent_analysis=intent_analysis
     )
 
-    # 4. GENERATION DE LA REPONSE
+    # Phase B : Génération de la réponse
     customer_response = await generate_customer_response(
         client=client,
         customer_message=customer_message,
@@ -249,7 +373,6 @@ async def process_customer_message(
         products=products
     )
 
-    # 5. RETOUR DU RESULTAT
     return ChatbotResponse(
         message=customer_response,
         escalated=False,
