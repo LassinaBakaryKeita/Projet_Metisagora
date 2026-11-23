@@ -1,6 +1,7 @@
-
 import json
 import logging
+
+from decimal import Decimal
 
 from google import genai
 from google.genai import types
@@ -27,9 +28,9 @@ from app.modules.notifications.schemas import NotificationCreate
 logger = logging.getLogger(__name__)
 
 
-
-# CONFIGURATION DES MODÈLES GEMINI
-
+# ============================================================
+# CONFIGURATION GEMINI
+# ============================================================
 
 GEMINI_MODELS = [
     "gemini-3.1-flash-lite",
@@ -37,21 +38,12 @@ GEMINI_MODELS = [
     "gemini-3.8-flash"
 ]
 
-# Erreurs temporaires pouvant justifier un changement de modèle
 RETRYABLE_STATUS_CODES = {
     408, 429, 500, 502, 503, 504
 }
 
 
-# ============================================================
-# GÉNÉRATION AVEC FALLBACK
-# ============================================================
-
 def is_retryable_error(error: Exception) -> bool:
-    """
-    Determines whether an error is temporary
-    and whether another Gemini model should be tried.
-    """
 
     status_code = getattr(error, "code", None)
 
@@ -73,22 +65,13 @@ async def generate_with_fallback(
     temperature: float,
     response_mime_type: str | None = None
 ):
-    """
-    Tries Gemini models sequentially.
-
-    If a model encounters a temporary availability error,
-    the next model is automatically used.
-    """
 
     last_error = None
 
     for index, model in enumerate(GEMINI_MODELS):
 
         try:
-            logger.info(
-                "Trying Gemini model: %s",
-                model
-            )
+            logger.info("Trying Gemini model: %s", model)
 
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -102,51 +85,39 @@ async def generate_with_fallback(
                 config=config
             )
 
-            logger.info(
-                "Gemini response generated successfully "
-                "using model: %s",
-                model
-            )
+            if response.text:
+                return response
 
-            return response
+            raise ValueError("Gemini returned an empty response.")
 
         except Exception as error:
 
             last_error = error
 
-            # Do not switch models for permanent errors
             if not is_retryable_error(error):
                 logger.exception(
-                    "Non-retryable Gemini error with model %s",
+                    "Non-retryable Gemini error: %s",
                     model
                 )
                 raise
 
             logger.warning(
-                "Gemini model %s is temporarily unavailable. "
-                "Trying the next model. Error: %s",
+                "Gemini model %s unavailable: %s",
                 model,
                 error
             )
 
-            # No more models available
             if index == len(GEMINI_MODELS) - 1:
                 break
-
-    logger.error(
-        "All Gemini models are currently unavailable."
-    )
 
     if last_error:
         raise last_error
 
-    raise RuntimeError(
-        "No Gemini model could generate a response."
-    )
+    raise RuntimeError("No Gemini model could generate a response.")
 
 
 # ============================================================
-# PHASE A : ANALYSE DE L'INTENTION DU CLIENT
+# PHASE A : ANALYSE DE L'INTENTION
 # ============================================================
 
 async def analyze_customer_intent(
@@ -162,19 +133,11 @@ async def analyze_customer_intent(
         response_mime_type="application/json"
     )
 
-    content = response.text
-
-    if not content:
-        raise ValueError(
-            "Gemini returned an empty intent analysis."
-        )
-
-    # Strict validation with Pydantic
-    return IntentAnalysis.model_validate_json(content)
+    return IntentAnalysis.model_validate_json(response.text)
 
 
 # ============================================================
-# RECHERCHE DES PRODUITS DANS POSTGRESQL
+# RECHERCHE DANS LE CATALOGUE
 # ============================================================
 
 def search_relevant_products(
@@ -182,33 +145,81 @@ def search_relevant_products(
     intent_analysis: IntentAnalysis
 ) -> list[ProductContext]:
 
-    product_intents = {
+    intent = intent_analysis.intent
+
+    products = []
+
+    # 1. Catalogue général
+    if intent == CustomerIntent.PRODUCT_LIST:
+
+        products = product_service.get_catalog_products(db)
+
+        if intent_analysis.stock_filter == "in_stock":
+            products = [
+                product for product in products
+                if product.stock > 0
+            ]
+
+        elif intent_analysis.stock_filter == "out_of_stock":
+            products = [
+                product for product in products
+                if product.stock == 0
+            ]
+
+    # 2. Produit le plus cher ou le moins cher
+    elif intent in {
+        CustomerIntent.MOST_EXPENSIVE,
+        CustomerIntent.CHEAPEST
+    }:
+
+        product = product_service.get_extreme_price_product(
+            db=db,
+            highest=(intent == CustomerIntent.MOST_EXPENSIVE)
+        )
+
+        if product:
+            products = [product]
+
+    # 3. Recherches ciblées
+    elif intent in {
         CustomerIntent.PRODUCT_SEARCH,
+        CustomerIntent.PRODUCT_DETAILS,
         CustomerIntent.PRICE_INQUIRY,
-        CustomerIntent.STOCK_INQUIRY
-    }
+        CustomerIntent.STOCK_INQUIRY,
+        CustomerIntent.AVAILABILITY_SEARCH,
+        CustomerIntent.PRODUCT_COMPARISON,
+        CustomerIntent.PRODUCT_RECOMMENDATION
+    }:
 
-    if intent_analysis.intent not in product_intents:
-        return []
+        search_terms = list(intent_analysis.product_names)
 
-    if not intent_analysis.product_name:
-        return []
+        if intent_analysis.product_name:
+            search_terms.insert(0, intent_analysis.product_name)
 
-    result = product_service.get_products(
-        db=db,
-        page=1,
-        limit=10,
-        search=intent_analysis.product_name
-    )
+        if not search_terms and intent_analysis.search_query:
+            search_terms.append(intent_analysis.search_query)
 
-    products = result["items"]
+        found_products = {}
 
+        for term in search_terms:
+
+            results = product_service.search_products_for_chatbot(
+                db=db,
+                search=term
+            )
+
+            for product in results:
+                found_products[product.id] = product
+
+        products = list(found_products.values())
+
+    # Conversion des modèles SQLAlchemy
     return [
         ProductContext(
             id=product.id,
             name=product.name,
             description=product.description,
-            price=float(product.price),
+            price=Decimal(str(product.price)),
             stock=product.stock
         )
         for product in products
@@ -216,25 +227,22 @@ def search_relevant_products(
 
 
 # ============================================================
-# DÉCISION MÉTIER : ESCALADE HUMAINE
+# ESCALADE HUMAINE
 # ============================================================
 
 def should_escalate(
     intent_analysis: IntentAnalysis
 ) -> bool:
 
-    if intent_analysis.intent == CustomerIntent.HUMAN_REQUEST:
+    if intent_analysis.intent in {
+        CustomerIntent.HUMAN_REQUEST,
+        CustomerIntent.COMPLAINT,
+        CustomerIntent.ORDER_ISSUE
+    }:
         return True
 
-    if intent_analysis.escalation_recommended:
-        return True
+    return intent_analysis.escalation_recommended
 
-    return False
-
-
-# ============================================================
-# CRÉATION D'UNE NOTIFICATION
-# ============================================================
 
 def create_escalation_notification(
     db: Session,
@@ -251,7 +259,11 @@ def create_escalation_notification(
 
     priority = (
         "high"
-        if intent_analysis.intent == CustomerIntent.HUMAN_REQUEST
+        if intent_analysis.intent in {
+            CustomerIntent.HUMAN_REQUEST,
+            CustomerIntent.COMPLAINT,
+            CustomerIntent.ORDER_ISSUE
+        }
         else "medium"
     )
 
@@ -272,7 +284,7 @@ def create_escalation_notification(
 
 
 # ============================================================
-# PHASE B : GÉNÉRATION DE LA RÉPONSE AU CLIENT
+# PHASE B : GÉNÉRATION DE LA RÉPONSE
 # ============================================================
 
 async def generate_customer_response(
@@ -282,40 +294,28 @@ async def generate_customer_response(
     products: list[ProductContext]
 ) -> str:
 
-    product_data = [
-        product.model_dump(mode="json")
-        for product in products
-    ]
-
     context = {
         "customer_message": customer_message,
         "intent_analysis": intent_analysis.model_dump(mode="json"),
-        "products_from_database": product_data
+        "products_from_database": [
+            product.model_dump(mode="json")
+            for product in products
+        ],
+        "products_found": len(products)
     }
 
     response = await generate_with_fallback(
         client=client,
-        contents=(
-            "Voici le contexte de la conversation et "
-            "les données commerciales disponibles.\n\n"
-            + json.dumps(
-                context,
-                ensure_ascii=False,
-                indent=2
-            )
+        contents=json.dumps(
+            context,
+            ensure_ascii=False,
+            indent=2
         ),
         system_instruction=CUSTOMER_RESPONSE_PROMPT,
         temperature=0.4
     )
 
-    content = response.text
-
-    if not content:
-        raise ValueError(
-            "Gemini returned an empty customer response."
-        )
-
-    return content.strip()
+    return response.text.strip()
 
 
 # ============================================================
@@ -330,16 +330,21 @@ async def process_customer_message(
     customer_name: str | None = None
 ) -> ChatbotResponse:
 
-    # Phase A : Analyse de l'intention
+    # PHASE A : compréhension du message
     intent_analysis = await analyze_customer_intent(
         client=client,
         customer_message=customer_message
     )
 
-    # Vérification d'une éventuelle escalade humaine
+    logger.info(
+        "Detected customer intent: %s",
+        intent_analysis.intent.value
+    )
+
+    # Escalade humaine
     if should_escalate(intent_analysis):
 
-        escalation_reason = create_escalation_notification(
+        reason = create_escalation_notification(
             db=db,
             customer_message=customer_message,
             customer_phone=customer_phone,
@@ -355,17 +360,22 @@ async def process_customer_message(
                 "dans les meilleurs délais."
             ),
             escalated=True,
-            escalation_reason=escalation_reason,
+            escalation_reason=reason,
             intent=intent_analysis.intent
         )
 
-    # Recherche des produits dans PostgreSQL
+    # Récupération des données PostgreSQL
     products = search_relevant_products(
         db=db,
         intent_analysis=intent_analysis
     )
 
-    # Phase B : Génération de la réponse
+    logger.info(
+        "Products retrieved from database: %s",
+        len(products)
+    )
+
+    # PHASE B : formulation de la réponse
     customer_response = await generate_customer_response(
         client=client,
         customer_message=customer_message,
@@ -376,6 +386,5 @@ async def process_customer_message(
     return ChatbotResponse(
         message=customer_response,
         escalated=False,
-        escalation_reason=None,
         intent=intent_analysis.intent
     )

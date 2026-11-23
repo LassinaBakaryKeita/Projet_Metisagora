@@ -150,3 +150,75 @@ def delete_product(db: Session, product_id: int):
     except Exception:
         db.rollback()
         raise
+
+
+# ============================================================
+# CHATBOT : RECHERCHES COMMERCIALES
+# ============================================================
+
+def get_catalog_products(db: Session) -> list[Product]:
+    """Retourne tous les produits, même ceux en rupture de stock."""
+
+    statement = select(Product).order_by(Product.name.asc())
+    return list(db.scalars(statement).all())
+
+
+def search_products_for_chatbot(
+    db: Session,
+    search: str,
+    limit: int = 20
+) -> list[Product]:
+    """Recherche un produit par son nom ou sa description."""
+
+    search = search.strip()
+
+    if not search:
+        return []
+
+    # Priorité aux correspondances exactes du nom
+    exact_statement = select(Product).where(
+        func.lower(Product.name) == search.lower()
+    )
+
+    exact_products = list(db.scalars(exact_statement).all())
+
+    if exact_products:
+        return exact_products
+
+    # Sinon, recherche partielle
+    search_term = f"%{search}%"
+
+    statement = (
+        select(Product)
+        .where(
+            or_(
+                Product.name.ilike(search_term),
+                Product.description.ilike(search_term)
+            )
+        )
+        .order_by(Product.name.asc())
+        .limit(limit)
+    )
+
+    return list(db.scalars(statement).all())
+
+
+def get_extreme_price_product(
+    db: Session,
+    highest: bool = True
+) -> Product | None:
+    """Retourne le produit le plus cher ou le moins cher."""
+
+    ordering = (
+        Product.price.desc()
+        if highest
+        else Product.price.asc()
+    )
+
+    statement = select(Product).order_by(
+        ordering,
+        Product.id.asc()
+    ).limit(1)
+
+    return db.scalar(statement)
+    
