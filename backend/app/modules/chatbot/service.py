@@ -1,5 +1,7 @@
+import asyncio
 import json
 import logging
+import time
 
 from decimal import Decimal
 
@@ -29,26 +31,45 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
-# CONFIGURATION GEMINI
+# CONFIGURATION GEMINI & CIRCUIT BREAKER
 # ============================================================
 
+# Modèles ordonnés par disponibilité, rapidité et stabilité actuelles
 GEMINI_MODELS = [
-    "gemini-3.1-flash-lite",
-    "gemini-3.5-flash-lite",
-    "gemini-3.8-flash"
+    "gemini-3.5-flash-lite",  # Très rapide, ultra disponible
+    "gemini-3.5-flash",       # Robuste et stable
+    "gemini-3.8-flash",       # Modèle supérieur de secours
+    "gemini-3.1-flash-lite"   # Dernier recours
 ]
 
+# Erreurs temporaires justifiant un basculement immédiat
 RETRYABLE_STATUS_CODES = {
     408, 429, 500, 502, 503, 504
 }
 
+# Circuit Breaker dynamique en mémoire
+# Évite de réinterroger un modèle saturé (503/429) pendant 3 minutes
+MODEL_COOLDOWNS: dict[str, float] = {}
+COOLDOWN_DURATION_SECONDS = 180.0
+
+# Timeout strict par requête : coupe court si Google tarde à répondre (évite de bloquer 20s)
+MODEL_TIMEOUT_SECONDS = 8.0
+
 
 def is_retryable_error(error: Exception) -> bool:
+    if isinstance(error, (asyncio.TimeoutError, TimeoutError)):
+        return True
 
     status_code = getattr(error, "code", None)
-
     if status_code is None:
         status_code = getattr(error, "status_code", None)
+
+    if status_code is None:
+        err_str = str(error)
+        for code in RETRYABLE_STATUS_CODES:
+            if str(code) in err_str:
+                return True
+        return False
 
     try:
         status_code = int(status_code)
@@ -58,6 +79,34 @@ def is_retryable_error(error: Exception) -> bool:
     return status_code in RETRYABLE_STATUS_CODES
 
 
+def get_prioritized_models() -> list[str]:
+    """
+    Retourne la liste des modèles en plaçant en premier
+    les modèles qui ne sont pas en période de refroidissement (cooldown).
+    """
+    now = time.time()
+    available = []
+    in_cooldown = []
+
+    for model in GEMINI_MODELS:
+        cooldown_until = MODEL_COOLDOWNS.get(model, 0.0)
+        if now >= cooldown_until:
+            available.append(model)
+        else:
+            in_cooldown.append(model)
+
+    # Si tous les modèles sont en cooldown, on les réessaie tous pour ne pas bloquer
+    if not available:
+        logger.warning(
+            "Tous les modèles Gemini étaient en cooldown. Réinitialisation globale."
+        )
+        MODEL_COOLDOWNS.clear()
+        return list(GEMINI_MODELS)
+
+    # D'abord les modèles sains, puis ceux en cooldown en dernier recours
+    return available + in_cooldown
+
+
 async def generate_with_fallback(
     client: genai.Client,
     contents: str,
@@ -65,13 +114,12 @@ async def generate_with_fallback(
     temperature: float,
     response_mime_type: str | None = None
 ):
-
+    models_to_try = get_prioritized_models()
     last_error = None
 
-    for index, model in enumerate(GEMINI_MODELS):
-
+    for index, model in enumerate(models_to_try):
         try:
-            logger.info("Trying Gemini model: %s", model)
+            logger.info("Tentative avec le modèle Gemini: %s", model)
 
             config = types.GenerateContentConfig(
                 system_instruction=system_instruction,
@@ -79,41 +127,46 @@ async def generate_with_fallback(
                 response_mime_type=response_mime_type
             )
 
-            response = await client.aio.models.generate_content(
-                model=model,
-                contents=contents,
-                config=config
+            # Timeout strict pour basculer rapidement si Google bloque
+            response = await asyncio.wait_for(
+                client.aio.models.generate_content(
+                    model=model,
+                    contents=contents,
+                    config=config
+                ),
+                timeout=MODEL_TIMEOUT_SECONDS
             )
 
-            if response.text:
+            if response.text and response.text.strip():
+                # Succès : sortie immédiate du cooldown pour ce modèle
+                MODEL_COOLDOWNS.pop(model, None)
+                logger.info("Succès génération avec le modèle: %s", model)
                 return response
 
-            raise ValueError("Gemini returned an empty response.")
+            raise ValueError("Gemini a retourné une réponse vide.")
 
         except Exception as error:
-
             last_error = error
 
             if not is_retryable_error(error):
-                logger.exception(
-                    "Non-retryable Gemini error: %s",
-                    model
-                )
+                logger.exception("Erreur non réessayable avec le modèle %s: %s", model, error)
                 raise
 
+            # Modèle saturé (503 / 429 / timeout) : mise en quarantaine 3 minutes
+            MODEL_COOLDOWNS[model] = time.time() + COOLDOWN_DURATION_SECONDS
             logger.warning(
-                "Gemini model %s unavailable: %s",
+                "Modèle %s temporairement indisponible (placé en quarantaine 3 min). Erreur: %s",
                 model,
                 error
             )
 
-            if index == len(GEMINI_MODELS) - 1:
+            if index == len(models_to_try) - 1:
                 break
 
     if last_error:
         raise last_error
 
-    raise RuntimeError("No Gemini model could generate a response.")
+    raise RuntimeError("Aucun modèle Gemini n'a pu générer de réponse.")
 
 
 # ============================================================

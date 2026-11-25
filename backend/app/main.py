@@ -1,4 +1,5 @@
 
+import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
@@ -6,6 +7,12 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.router import api_router
 from app.integrations.ai.client import create_gemini_client
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s"
+)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager

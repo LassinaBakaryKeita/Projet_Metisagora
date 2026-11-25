@@ -1,15 +1,17 @@
 
 import logging
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Query, Request
 from fastapi.responses import PlainTextResponse
+from google import genai
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.database.connection import get_db
+from app.database.connection import SessionLocal
 
 from app.integrations.whatsapp.client import send_text_message
 from app.integrations.whatsapp.schemas import (
+    ExtractedWhatsAppMessage,
     WhatsAppWebhookPayload,
     extract_text_messages
 )
@@ -35,6 +37,68 @@ FALLBACK_MESSAGE = (
     "Pourriez-vous réessayer dans quelques instants ? "
     "Merci pour votre compréhension."
 )
+
+
+async def process_and_send_whatsapp_response(
+    incoming_message: ExtractedWhatsAppMessage,
+    gemini_client: genai.Client
+) -> None:
+    """
+    Tâche d'arrière-plan (Background Task) pour traiter le message
+    avec l'IA et envoyer la réponse sur WhatsApp.
+    Permet au Webhook Meta de recevoir un 200 OK immédiat (< 100ms)
+    et élimine tout risque de timeout Meta (15s).
+    """
+    message_id = incoming_message.message_id
+    db: Session = SessionLocal()
+
+    try:
+        logger.info(
+            "Background: Début du traitement du message WhatsApp ID: %s",
+            message_id
+        )
+
+        try:
+            chatbot_response = await process_customer_message(
+                db=db,
+                client=gemini_client,
+                customer_message=incoming_message.message_text,
+                customer_phone=incoming_message.customer_phone,
+                customer_name=incoming_message.customer_name
+            )
+            response_message = chatbot_response.message
+
+            logger.info(
+                "Background: Réponse IA générée avec succès pour le message ID: %s",
+                message_id
+            )
+
+        except Exception:
+            logger.exception(
+                "Background: Échec traitement chatbot pour le message ID: %s",
+                message_id
+            )
+            response_message = FALLBACK_MESSAGE
+
+        # Envoi de la réponse sur WhatsApp
+        await send_text_message(
+            recipient_phone=incoming_message.customer_phone,
+            message=response_message
+        )
+
+        logger.info(
+            "Background: Réponse WhatsApp envoyée avec succès au client %s",
+            incoming_message.customer_phone
+        )
+
+    except Exception:
+        logger.exception(
+            "Background: Erreur fatale lors de l'envoi WhatsApp pour le message ID: %s",
+            message_id
+        )
+
+    finally:
+        db.close()
 
 
 # ============================================================
@@ -81,7 +145,7 @@ async def verify_webhook(
 async def receive_whatsapp_message(
     payload: WhatsAppWebhookPayload,
     request: Request,
-    db: Session = Depends(get_db)
+    background_tasks: BackgroundTasks
 ):
 
     logger.info(
@@ -157,116 +221,22 @@ async def receive_whatsapp_message(
     # 4. Récupération du client Gemini partagé
     gemini_client = request.app.state.gemini_client
 
-    # 5. Traitement des messages
-    processed_count = 0
-    fallback_count = 0
-    failed_count = 0
-
+    # 5. Planification immédiate en arrière-plan
+    # Réponse instantanée à Meta (HTTP 200) pour garantir zéro timeout
     for incoming_message in valid_messages:
-
-        message_id = incoming_message.message_id
-
-        logger.info(
-            "Processing incoming WhatsApp message. Message ID: %s",
-            message_id
+        background_tasks.add_task(
+            process_and_send_whatsapp_response,
+            incoming_message=incoming_message,
+            gemini_client=gemini_client
         )
 
-        # ----------------------------------------------------
-        # ÉTAPE A : TRAITEMENT PAR LE CHATBOT
-        # ----------------------------------------------------
-
-        try:
-
-            chatbot_response = await process_customer_message(
-                db=db,
-                client=gemini_client,
-                customer_message=incoming_message.message_text,
-                customer_phone=incoming_message.customer_phone,
-                customer_name=incoming_message.customer_name
-            )
-
-            response_message = chatbot_response.message
-
-            logger.info(
-                "Chatbot response generated successfully. "
-                "Message ID: %s",
-                message_id
-            )
-
-        except Exception:
-
-            logger.exception(
-                "Chatbot processing failed. "
-                "Message ID: %s",
-                message_id
-            )
-
-            # Réponse statique indépendante de Gemini
-            response_message = FALLBACK_MESSAGE
-
-            fallback_count += 1
-
-        # ----------------------------------------------------
-        # ÉTAPE B : ENVOI DE LA RÉPONSE SUR WHATSAPP
-        # ----------------------------------------------------
-
-        try:
-
-            send_result = await send_text_message(
-                recipient_phone=incoming_message.customer_phone,
-                message=response_message
-            )
-
-            processed_count += 1
-
-            logger.info(
-                "WhatsApp response sent successfully. "
-                "Message ID: %s",
-                message_id
-            )
-
-            if fallback_count > 0:
-                logger.info(
-                    "Fallback response used for message ID: %s",
-                    message_id
-                )
-
-        except Exception:
-
-            failed_count += 1
-
-            logger.exception(
-                "Failed to send WhatsApp response. "
-                "Message ID: %s",
-                message_id
-            )
-
-    # 6. Résultat global
-    if failed_count == 0:
-
-        status = "success"
-
-    elif processed_count > 0:
-
-        status = "partial_success"
-
-    else:
-
-        status = "failed"
-
     logger.info(
-        "WhatsApp webhook processing completed. "
-        "Received: %s | Sent: %s | Fallback: %s | Failed: %s",
-        len(valid_messages),
-        processed_count,
-        fallback_count,
-        failed_count
+        "WhatsApp webhook acknowledged. %s message(s) queued for processing.",
+        len(valid_messages)
     )
 
     return {
-        "status": status,
+        "status": "success",
         "messages_received": len(valid_messages),
-        "messages_processed": processed_count,
-        "fallback_responses": fallback_count,
-        "messages_failed": failed_count
+        "messages_queued": len(valid_messages)
     }
