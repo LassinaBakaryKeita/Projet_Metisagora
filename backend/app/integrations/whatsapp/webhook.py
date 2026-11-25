@@ -13,7 +13,8 @@ from app.integrations.whatsapp.client import send_text_message
 from app.integrations.whatsapp.schemas import (
     ExtractedWhatsAppMessage,
     WhatsAppWebhookPayload,
-    extract_text_messages
+    extract_text_messages,
+    extract_statuses
 )
 
 from app.modules.chatbot.service import process_customer_message
@@ -81,14 +82,15 @@ async def process_and_send_whatsapp_response(
             response_message = FALLBACK_MESSAGE
 
         # Envoi de la réponse sur WhatsApp
-        await send_text_message(
+        send_result = await send_text_message(
             recipient_phone=incoming_message.customer_phone,
             message=response_message
         )
 
         logger.info(
-            "Background: Réponse WhatsApp envoyée avec succès au client %s",
-            incoming_message.customer_phone
+            "Background: Réponse WhatsApp transmise à Meta avec succès pour %s. Résultat Meta: %s",
+            incoming_message.customer_phone,
+            send_result
         )
 
     except Exception:
@@ -169,9 +171,49 @@ async def receive_whatsapp_message(
     incoming_messages = extract_text_messages(payload)
 
     if not incoming_messages:
+        # Vérification si c'est un accusé de réception / statut de livraison Meta
+        statuses = extract_statuses(payload)
+        if statuses:
+            for s in statuses:
+                s_val = s.get("status")
+                s_recipient = s.get("recipient_id")
+                s_id = s.get("id")
+                s_errors = s.get("errors")
+
+                if s_val == "failed":
+                    logger.error(
+                        "❌ [META STATUS FAILED] Échec livraison message %s à %s. Détails erreurs: %s",
+                        s_id,
+                        s_recipient,
+                        s_errors
+                    )
+                elif s_val == "delivered":
+                    logger.info(
+                        "✅ [META STATUS DELIVERED] Message %s délivré au téléphone de %s",
+                        s_id,
+                        s_recipient
+                    )
+                elif s_val == "read":
+                    logger.info(
+                        "👀 [META STATUS READ] Message %s lu par %s",
+                        s_id,
+                        s_recipient
+                    )
+                else:
+                    logger.info(
+                        "ℹ️ [META STATUS] Statut '%s' pour message %s (client: %s)",
+                        s_val,
+                        s_id,
+                        s_recipient
+                    )
+
+            return {
+                "status": "received",
+                "statuses_processed": len(statuses)
+            }
 
         logger.info(
-            "Webhook received without incoming text messages."
+            "Webhook received without incoming text messages or statuses."
         )
 
         return {

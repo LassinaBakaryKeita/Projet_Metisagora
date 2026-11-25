@@ -56,6 +56,10 @@ class WhatsAppWebhookValue(WhatsAppBaseSchema):
         default_factory=list
     )
 
+    statuses: list[dict] = Field(
+        default_factory=list
+    )
+
 
 # Changements du Webhook
 class WhatsAppWebhookChange(WhatsAppBaseSchema):
@@ -147,3 +151,20 @@ def extract_text_messages(
                 )
 
     return extracted_messages
+
+
+def extract_statuses(
+    payload: WhatsAppWebhookPayload
+) -> list[dict]:
+    """
+    Extract message status updates (sent, delivered, read, failed)
+    from a WhatsApp webhook.
+    """
+    statuses = []
+
+    for entry in payload.entry:
+        for change in entry.changes:
+            if change.field == "messages" and change.value.statuses:
+                statuses.extend(change.value.statuses)
+
+    return statuses
