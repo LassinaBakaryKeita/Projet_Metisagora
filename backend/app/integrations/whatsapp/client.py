@@ -9,14 +9,15 @@ from app.core.config import settings
 
 async def send_text_message(
     recipient_phone: str,
-    message: str
+    message: str,
+    sender_phone_number_id: str | None = None
 ) -> dict:
     """
     Send a text message to a WhatsApp customer
     using Meta WhatsApp Cloud API.
     """
     token = settings.whatsapp_access_token.get_secret_value().strip()
-    phone_id = str(settings.whatsapp_phone_number_id).strip()
+    phone_id = (sender_phone_number_id or str(settings.whatsapp_phone_number_id)).strip()
     api_version = str(settings.whatsapp_api_version).strip()
     url = f"https://graph.facebook.com/{api_version}/{phone_id}/messages"
 

@@ -84,7 +84,8 @@ async def process_and_send_whatsapp_response(
         # Envoi de la réponse sur WhatsApp
         send_result = await send_text_message(
             recipient_phone=incoming_message.customer_phone,
-            message=response_message
+            message=response_message,
+            sender_phone_number_id=incoming_message.business_phone_number_id
         )
 
         logger.info(
@@ -222,9 +223,12 @@ async def receive_whatsapp_message(
         }
 
     # 3. Vérification du numéro Business configuré
-    configured_phone_number_id = str(
-        settings.whatsapp_phone_number_id
-    ).strip()
+    raw_configured_ids = str(settings.whatsapp_phone_number_id).strip()
+    configured_ids = [
+        pid.strip()
+        for pid in raw_configured_ids.split(",")
+        if pid.strip()
+    ]
 
     valid_messages = []
 
@@ -235,13 +239,15 @@ async def receive_whatsapp_message(
         ).strip()
 
         if (
-            configured_phone_number_id
-            and received_phone_number_id != configured_phone_number_id
+            configured_ids
+            and received_phone_number_id not in configured_ids
         ):
 
             logger.warning(
-                "Ignoring message from unexpected WhatsApp "
-                "Business Phone Number ID. Message ID: %s",
+                "Ignoring message from unexpected WhatsApp Business Phone Number ID: "
+                "received='%s', configured=%s. Message ID: %s",
+                received_phone_number_id,
+                configured_ids,
                 incoming_message.message_id
             )
 
